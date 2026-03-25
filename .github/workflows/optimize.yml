@@ -1,0 +1,98 @@
+name: Optimize Decks
+
+on:
+  workflow_dispatch:   # Manual trigger from GitHub UI
+  push:
+    branches: [main, master]
+    paths:
+      - '**'
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────────────
+  # STAGE 1: One job per tower troop — runs in parallel
+  # Each job: beam search (500K width) + 20-pass hill climbing for one tower.
+  # Results saved to output/results_{tower}.json and uploaded as an artifact.
+  # ────────────────────────────────────────────────────────────────────────────
+  optimize:
+    name: Optimize — ${{ matrix.tower }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360       # 6-hour cap — maximum GitHub Actions allows per job
+
+    strategy:
+      fail-fast: false         # Keep other towers running if one fails
+      matrix:
+        tower: [princess, cannoneer, dagger_duchess, royal_chef]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # Cache the combo cache .pkl by patch version + weights hash.
+      # If a previous run cached for the same patch, the beam skips the
+      # 2-3 min rebuild step and loads instantly.
+      - name: Cache combo cache
+        uses: actions/cache@v4
+        with:
+          path: cache/
+          key: combo-cache-${{ hashFiles('config.py') }}
+
+      - name: Install dependencies
+        run: pip install pytest
+
+      - name: Run optimizer — ${{ matrix.tower }}
+        run: |
+          python main.py --tower ${{ matrix.tower }}
+
+      - name: Upload tower results
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-${{ matrix.tower }}
+          path: output/results_${{ matrix.tower }}.json
+          if-no-files-found: error
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # STAGE 2: Merge all 4 tower results → top_decks.json
+  # Runs after ALL optimize jobs complete successfully.
+  # ────────────────────────────────────────────────────────────────────────────
+  merge:
+    name: Merge Results
+    runs-on: ubuntu-latest
+    needs: optimize            # Wait for all 4 tower jobs
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Download all tower results
+        uses: actions/download-artifact@v4
+        with:
+          # Downloads each artifact into a sub-folder named after the artifact.
+          # e.g. results-princess/results_princess.json
+          path: output/
+          merge-multiple: true   # Flatten into output/ directly
+
+      - name: Merge and rank top decks
+        run: |
+          python main.py --merge
+
+      - name: Upload final top_decks.json
+        uses: actions/upload-artifact@v4
+        with:
+          name: top-decks
+          path: output/top_decks.json
+          if-no-files-found: error
+
+      - name: Print top decks summary
+        run: |
+          echo "── Final top_decks.json ──"
+          cat output/top_decks.json
